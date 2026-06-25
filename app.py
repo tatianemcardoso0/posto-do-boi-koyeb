@@ -1248,6 +1248,7 @@ def ensure_sqlite_compat_schema():
 
 
 def seed_database():
+    db.create_all()
     ensure_sqlite_compat_schema()
     if CompanyBrand.query.first():
         return
