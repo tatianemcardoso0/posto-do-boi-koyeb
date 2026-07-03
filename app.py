@@ -6,6 +6,7 @@ from datetime import datetime, date
 from functools import wraps
 from io import BytesIO
 from statistics import mean
+from xml.sax.saxutils import escape as xml_escape
 
 import matplotlib
 matplotlib.use('Agg')
@@ -190,6 +191,14 @@ def log_action(action, entity_type, entity_id=None, details=''):
         details=details,
     ))
     db.session.commit()
+
+
+def safe_text(value):
+    return xml_escape(str(value or ''))
+
+
+def safe_paragraph_text(value):
+    return safe_text(value).replace('\n', '<br/>')
 
 
 # =========================================================
@@ -590,41 +599,135 @@ def company_settings():
 @app.route('/employees', methods=['GET', 'POST'])
 @login_required(role='manager')
 def employees():
-    managers = User.query.filter_by(role='manager').all()
+    managers = User.query.filter_by(role='manager').order_by(User.name).all()
     if request.method == 'POST':
+        email = request.form['email'].strip().lower()
+        if User.query.filter_by(email=email).first():
+            flash('Já existe um colaborador cadastrado com este e-mail.', 'warning')
+            return redirect(url_for('employees'))
+
+        manager = User.query.filter_by(id=int(request.form['manager_id']), role='manager').first()
+        if not manager:
+            flash('Gestor responsável inválido.', 'danger')
+            return redirect(url_for('employees'))
+
         admission_str = request.form.get('admission_date', '').strip()
+        admission_date = None
+        if admission_str:
+            try:
+                admission_date = datetime.strptime(admission_str, '%Y-%m-%d').date()
+            except ValueError:
+                flash('Data de admissão inválida.', 'danger')
+                return redirect(url_for('employees'))
+
         user = User(
             name=request.form['name'].strip(),
-            email=request.form['email'].strip().lower(),
+            email=email,
             role='employee',
             department=request.form['department'].strip(),
             position=request.form['position'].strip(),
             unit=request.form.get('unit', 'Posto do Boi').strip() or 'Posto do Boi',
-            admission_date=datetime.strptime(admission_str, '%Y-%m-%d').date() if admission_str else None,
-            manager_id=int(request.form['manager_id']),
+            admission_date=admission_date,
+            manager_id=manager.id,
             active=True,
         )
-        user.set_password(request.form.get('password') or '123456')
+        user.set_password((request.form.get('password') or '123456').strip() or '123456')
         db.session.add(user)
         db.session.commit()
         log_action('Cadastrou colaborador', 'user', user.id, user.name)
         flash(f'Colaborador {user.name} cadastrado com sucesso.', 'success')
         return redirect(url_for('employees'))
+
     employees_list = User.query.filter_by(role='employee').order_by(User.name).all()
     return render_template('employees.html', employees=employees_list, managers=managers)
 
 
-@app.route('/employees/<int:user_id>/toggle')
+@app.route('/employees/<int:user_id>/edit', methods=['GET', 'POST'])
+@login_required(role='manager')
+def edit_employee(user_id):
+    employee = User.query.get_or_404(user_id)
+    if employee.role != 'employee':
+        flash('Somente colaboradores podem ser editados nesta tela.', 'warning')
+        return redirect(url_for('employees'))
+
+    managers = User.query.filter_by(role='manager').order_by(User.name).all()
+    if request.method == 'POST':
+        email = request.form['email'].strip().lower()
+        existing_user = User.query.filter(User.email == email, User.id != employee.id).first()
+        if existing_user:
+            flash('Já existe outro colaborador cadastrado com este e-mail.', 'warning')
+            return redirect(url_for('edit_employee', user_id=employee.id))
+
+        manager = User.query.filter_by(id=int(request.form['manager_id']), role='manager').first()
+        if not manager:
+            flash('Gestor responsável inválido.', 'danger')
+            return redirect(url_for('edit_employee', user_id=employee.id))
+
+        admission_str = request.form.get('admission_date', '').strip()
+        admission_date = None
+        if admission_str:
+            try:
+                admission_date = datetime.strptime(admission_str, '%Y-%m-%d').date()
+            except ValueError:
+                flash('Data de admissão inválida.', 'danger')
+                return redirect(url_for('edit_employee', user_id=employee.id))
+
+        employee.name = request.form['name'].strip()
+        employee.email = email
+        employee.department = request.form['department'].strip()
+        employee.position = request.form['position'].strip()
+        employee.unit = request.form.get('unit', 'Posto do Boi').strip() or 'Posto do Boi'
+        employee.admission_date = admission_date
+        employee.manager_id = manager.id
+
+        new_password = request.form.get('password', '').strip()
+        if new_password:
+            employee.set_password(new_password)
+
+        db.session.commit()
+        log_action('Editou colaborador', 'user', employee.id, employee.name)
+        flash(f'Cadastro de {employee.name} atualizado com sucesso.', 'success')
+        return redirect(url_for('employees'))
+
+    return render_template('edit_employee.html', employee=employee, managers=managers)
+
+
+@app.route('/employees/<int:user_id>/toggle', methods=['POST'])
 @login_required(role='manager')
 def toggle_employee(user_id):
     user = User.query.get_or_404(user_id)
-    if user.role == 'manager':
-        flash('Não é possível inativar um gestor por aqui.', 'warning')
+    if user.role != 'employee':
+        flash('Não é possível alterar o status de um gestor por aqui.', 'warning')
         return redirect(url_for('employees'))
     user.active = not user.active
     db.session.commit()
     log_action('Alterou status do colaborador', 'user', user.id, f'Ativo={user.active}')
-    flash('Status do colaborador atualizado.', 'info')
+    flash(f'Status de {user.name} atualizado com sucesso.', 'info')
+    return redirect(url_for('employees'))
+
+
+@app.route('/employees/<int:user_id>/delete', methods=['POST'])
+@login_required(role='manager')
+def delete_employee(user_id):
+    user = User.query.get_or_404(user_id)
+    if user.role != 'employee':
+        flash('Não é possível excluir um gestor por aqui.', 'warning')
+        return redirect(url_for('employees'))
+
+    assignment_ids = [row[0] for row in db.session.query(Assignment.id).filter_by(employee_id=user.id).all()]
+    if assignment_ids:
+        FinalFeedback.query.filter(FinalFeedback.assignment_id.in_(assignment_ids)).delete(synchronize_session=False)
+        Response.query.filter(Response.assignment_id.in_(assignment_ids)).delete(synchronize_session=False)
+        Assignment.query.filter(Assignment.id.in_(assignment_ids)).delete(synchronize_session=False)
+
+    AuditLog.query.filter_by(user_id=user.id).delete(synchronize_session=False)
+
+    deleted_name = user.name
+    db.session.delete(user)
+    db.session.commit()
+
+    log_action('Excluiu colaborador', 'user', user_id, deleted_name)
+    flash(f'Colaborador {deleted_name} excluído com sucesso.', 'success')
     return redirect(url_for('employees'))
 
 
@@ -807,6 +910,16 @@ def report_pdf(assignment_id):
     brand = CompanyBrand.query.first()
     history_data = history_for_employee(assignment.employee_id, current_assignment_id=assignment.id)
 
+    brand_name = (brand.name if brand and brand.name else 'Posto do Boi e Express do Boi')
+    employee_name = safe_text(assignment.employee.name)
+    employee_position = safe_text(assignment.employee.position)
+    employee_department = safe_text(assignment.employee.department)
+    employee_unit = safe_text(assignment.employee.unit)
+    cycle_name = safe_text(assignment.cycle.name)
+    manager_name = safe_text(assignment.manager.name)
+    manager_position = safe_text(assignment.manager.position)
+    profile_label = safe_text(feedback.profile_label or 'Sem perfil definido')
+
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer, pagesize=A4,
@@ -856,7 +969,7 @@ def report_pdf(assignment_id):
         canvas.rect(0, A4[1] - 1*cm, A4[0], 1*cm, fill=1, stroke=0)
         canvas.setFillColor(colors.white)
         canvas.setFont('Helvetica-Bold', 9)
-        canvas.drawString(1.5*cm, A4[1] - 0.65*cm, brand.name)
+        canvas.drawString(1.5*cm, A4[1] - 0.65*cm, brand_name)
         canvas.drawRightString(A4[0] - 1.5*cm, A4[1] - 0.65*cm, 'Relatório de Avaliação 180°')
         canvas.setFillColor(grey)
         canvas.setFont('Helvetica', 8)
@@ -869,26 +982,23 @@ def report_pdf(assignment_id):
 
     story = []
 
-    # =========================
-    # CAPA
-    # =========================
     cover_table = Table(
         [[Paragraph('POSTO DO BOI &amp; EXPRESS DO BOI', styles['cover_kicker'])],
          [Spacer(1, 8)],
          [Paragraph('RELATÓRIO DE<br/>AVALIAÇÃO 180°', styles['cover_title'])],
          [Spacer(1, 14)],
-         [Paragraph(assignment.employee.name.upper(), styles['cover_name'])],
-         [Paragraph(f'{assignment.employee.position} • {assignment.employee.department}', styles['cover_sub'])],
-         [Paragraph(f'Unidade: {assignment.employee.unit}', styles['cover_meta'])],
+         [Paragraph(employee_name.upper(), styles['cover_name'])],
+         [Paragraph(f'{employee_position} • {employee_department}', styles['cover_sub'])],
+         [Paragraph(f'Unidade: {employee_unit}', styles['cover_meta'])],
          [Spacer(1, 30)],
-         [Paragraph(f'Ciclo: <b>{assignment.cycle.name}</b>', styles['cover_meta'])],
+         [Paragraph(f'Ciclo: <b>{cycle_name}</b>', styles['cover_meta'])],
          [Paragraph(f'Período: {assignment.cycle.start_date.strftime("%d/%m/%Y")} a {assignment.cycle.end_date.strftime("%d/%m/%Y")}', styles['cover_meta'])],
-         [Paragraph(f'Gestor responsável: <b>{assignment.manager.name}</b>', styles['cover_meta'])],
+         [Paragraph(f'Gestor responsável: <b>{manager_name}</b>', styles['cover_meta'])],
          [Spacer(1, 40)],
          [Paragraph(f'NOTA FINAL CONSOLIDADA<br/><font size="46">{summary["final_avg"]:.2f}</font>', styles['cover_sub'])],
-         [Paragraph(f'<b>{feedback.profile_label}</b>', styles['cover_kicker'])],
+         [Paragraph(f'<b>{profile_label}</b>', styles['cover_kicker'])],
          [Spacer(1, 60)],
-         [Paragraph(f'Documento confidencial • {brand.name}', styles['cover_meta'])],
+         [Paragraph(f'Documento confidencial • {safe_text(brand_name)}', styles['cover_meta'])],
         ],
         colWidths=[A4[0] - 3 * cm],
     )
@@ -905,22 +1015,18 @@ def report_pdf(assignment_id):
     story.append(cover_table)
     story.append(PageBreak())
 
-    # =========================
-    # PÁGINA 2 — RESUMO EXECUTIVO
-    # =========================
     story.append(Paragraph('Resumo Executivo', styles['h1']))
     story.append(Paragraph(
         f'Este relatório apresenta a consolidação completa da avaliação 180° de '
-        f'<b>{assignment.employee.name}</b>, considerando a autoavaliação do colaborador e a '
+        f'<b>{employee_name}</b>, considerando a autoavaliação do colaborador e a '
         f'percepção do gestor direto. O ciclo avalia <b>{len(summary["rows"])} critérios</b> '
         f'distribuídos em <b>{len(summary["category_compare"])} competências</b>, resultando em uma '
         f'nota final consolidada de <b>{summary["final_avg"]:.2f}</b> '
-        f'(perfil <b>{feedback.profile_label}</b>).',
+        f'(perfil <b>{profile_label}</b>).',
         styles['body'],
     ))
     story.append(Spacer(1, 12))
 
-    # KPIs em destaque
     kpi_data = [[
         Paragraph('AUTOAVALIAÇÃO', styles['metric_lbl']),
         Paragraph('AVALIAÇÃO GESTOR', styles['metric_lbl']),
@@ -943,7 +1049,6 @@ def report_pdf(assignment_id):
     story.append(kpi_table)
     story.append(Spacer(1, 14))
 
-    # Perfil e tabela de pontos fortes x desenvolvimento
     story.append(Paragraph('Pontos Fortes e Oportunidades de Desenvolvimento', styles['h2']))
     strength_list = [c for c in summary['category_avg'] if c['score'] >= 4.0][:5]
     development_list = sorted([c for c in summary['category_avg'] if c['score'] < 4.0], key=lambda x: x['score'])[:5]
@@ -952,7 +1057,7 @@ def report_pdf(assignment_id):
     if not development_list:
         development_list = sorted(summary['category_avg'], key=lambda x: x['score'])[:3]
 
-    max_rows = max(len(strength_list), len(development_list))
+    max_rows = max(len(strength_list), len(development_list)) if (strength_list or development_list) else 1
     sd_data = [[
         Paragraph('<b>✓ PONTOS FORTES</b>', styles['metric_lbl']),
         Paragraph('<b>↑ OPORTUNIDADES DE DESENVOLVIMENTO</b>', styles['metric_lbl']),
@@ -961,8 +1066,8 @@ def report_pdf(assignment_id):
         s = strength_list[i] if i < len(strength_list) else None
         d = development_list[i] if i < len(development_list) else None
         sd_data.append([
-            Paragraph(f"<b>{s['category']}</b><br/><font color='#15803d'>Nota: {s['score']:.2f}</font>", styles['small']) if s else Paragraph('', styles['small']),
-            Paragraph(f"<b>{d['category']}</b><br/><font color='#dc2626'>Nota: {d['score']:.2f}</font>", styles['small']) if d else Paragraph('', styles['small']),
+            Paragraph(f"<b>{safe_text(s['category'])}</b><br/><font color='#15803d'>Nota: {s['score']:.2f}</font>", styles['small']) if s else Paragraph('—', styles['small']),
+            Paragraph(f"<b>{safe_text(d['category'])}</b><br/><font color='#dc2626'>Nota: {d['score']:.2f}</font>", styles['small']) if d else Paragraph('—', styles['small']),
         ])
     sd_table = Table(sd_data, colWidths=[(A4[0] - 3*cm)/2, (A4[0] - 3*cm)/2])
     sd_table.setStyle(TableStyle([
@@ -979,9 +1084,6 @@ def report_pdf(assignment_id):
     story.append(sd_table)
     story.append(PageBreak())
 
-    # =========================
-    # PÁGINA 3 — GRÁFICOS
-    # =========================
     story.append(Paragraph('Análise Visual de Competências', styles['h1']))
     story.append(Paragraph(
         'Comparação visual entre a autoavaliação do colaborador e a percepção do gestor para cada competência avaliada.',
@@ -1010,9 +1112,6 @@ def report_pdf(assignment_id):
         img.hAlign = 'CENTER'
         story.append(img)
 
-    # =========================
-    # PÁGINA 4 — DETALHAMENTO POR CRITÉRIO
-    # =========================
     story.append(PageBreak())
     story.append(Paragraph('Detalhamento por Critério', styles['h1']))
     story.append(Paragraph(
@@ -1024,8 +1123,8 @@ def report_pdf(assignment_id):
     detail_data = [['Competência', 'Critério avaliado', 'Auto', 'Gestor', 'Final']]
     for item in summary['rows']:
         detail_data.append([
-            Paragraph(f"<b>{item['question'].category}</b>", styles['small']),
-            Paragraph(item['question'].text, styles['small']),
+            Paragraph(f"<b>{safe_text(item['question'].category)}</b>", styles['small']),
+            Paragraph(safe_paragraph_text(item['question'].text), styles['small']),
             str(item['employee'].score if item['employee'] else '-'),
             str(item['manager'].score if item['manager'] else '-'),
             f"{item['final_score']:.1f}" if item['final_score'] is not None else '-',
@@ -1052,9 +1151,6 @@ def report_pdf(assignment_id):
     detail_table.setStyle(TableStyle(detail_style))
     story.append(detail_table)
 
-    # =========================
-    # PÁGINA 5 — HISTÓRICO
-    # =========================
     if history_data:
         story.append(PageBreak())
         story.append(Paragraph('Histórico de Ciclos Anteriores', styles['h1']))
@@ -1102,24 +1198,19 @@ def report_pdf(assignment_id):
         ]))
         story.append(hist_table)
 
-    # =========================
-    # PÁGINA 6 — FEEDBACK CONSOLIDADO
-    # =========================
     story.append(PageBreak())
     story.append(Paragraph('Feedback Consolidado', styles['h1']))
-    for block in (feedback.editable_feedback or '').split('\n\n'):
+    feedback_blocks = (feedback.editable_feedback or '').split('\n\n')
+    for block in feedback_blocks:
         if block.strip():
-            story.append(Paragraph(block.replace('\n', '<br/>'), styles['body']))
+            story.append(Paragraph(safe_paragraph_text(block), styles['body']))
             story.append(Spacer(1, 8))
 
     if feedback.manager_comments:
         story.append(Spacer(1, 6))
         story.append(Paragraph('Comentários do Gestor', styles['h2']))
-        story.append(Paragraph(feedback.manager_comments.replace('\n', '<br/>'), styles['body']))
+        story.append(Paragraph(safe_paragraph_text(feedback.manager_comments), styles['body']))
 
-    # =========================
-    # PÁGINA 7 — PDI VISUAL 30/60/90
-    # =========================
     story.append(PageBreak())
     story.append(Paragraph('Plano de Desenvolvimento Individual (PDI)', styles['h1']))
     story.append(Paragraph(
@@ -1128,7 +1219,6 @@ def report_pdf(assignment_id):
     ))
     story.append(Spacer(1, 10))
 
-    # Timeline visual 30-60-90
     timeline_data = [[
         Paragraph('<b>30 DIAS</b><br/><font size="9">Aprendizado e prática inicial</font>', styles['metric_lbl']),
         Paragraph('<b>60 DIAS</b><br/><font size="9">Aplicação e consistência</font>', styles['metric_lbl']),
@@ -1145,14 +1235,12 @@ def report_pdf(assignment_id):
     story.append(timeline_table)
     story.append(Spacer(1, 14))
 
-    for block in (feedback.editable_pdi or '').split('\n\n'):
+    pdi_blocks = (feedback.editable_pdi or '').split('\n\n')
+    for block in pdi_blocks:
         if block.strip():
-            story.append(Paragraph(block.replace('\n', '<br/>'), styles['body_left']))
+            story.append(Paragraph(safe_paragraph_text(block), styles['body_left']))
             story.append(Spacer(1, 8))
 
-    # =========================
-    # PÁGINA FINAL — ASSINATURAS
-    # =========================
     story.append(PageBreak())
     story.append(Paragraph('Validação do Plano', styles['h1']))
     story.append(Paragraph(
@@ -1165,8 +1253,8 @@ def report_pdf(assignment_id):
     signature_line = '_' * 50
     sig_data = [
         [Paragraph(signature_line, styles['body']), Paragraph(signature_line, styles['body'])],
-        [Paragraph(f'<b>{assignment.employee.name}</b><br/>Colaborador<br/><font size="8" color="#64748b">{assignment.employee.position}</font>', styles['body']),
-         Paragraph(f'<b>{assignment.manager.name}</b><br/>Gestor responsável<br/><font size="8" color="#64748b">{assignment.manager.position}</font>', styles['body'])],
+        [Paragraph(f'<b>{employee_name}</b><br/>Colaborador<br/><font size="8" color="#64748b">{employee_position}</font>', styles['body']),
+         Paragraph(f'<b>{manager_name}</b><br/>Gestor responsável<br/><font size="8" color="#64748b">{manager_position}</font>', styles['body'])],
         [Spacer(1, 30), Spacer(1, 30)],
         [Paragraph('Data: ___/___/______', styles['small']), Paragraph('Data: ___/___/______', styles['small'])],
     ]
@@ -1184,11 +1272,17 @@ def report_pdf(assignment_id):
         styles['small'],
     ))
     story.append(Paragraph(
-        f'<i>{brand.name} • Confidencial • Uso interno exclusivo da liderança de RH.</i>',
+        f'<i>{safe_text(brand_name)} • Confidencial • Uso interno exclusivo da liderança de RH.</i>',
         styles['small'],
     ))
 
-    doc.build(story, onFirstPage=lambda c, d: None, onLaterPages=page_decorator)
+    try:
+        doc.build(story, onFirstPage=lambda c, d: None, onLaterPages=page_decorator)
+    except Exception:
+        app.logger.exception('Erro ao gerar relatório PDF')
+        flash('Não foi possível gerar o relatório PDF. Revise os textos do feedback e tente novamente.', 'danger')
+        return redirect(url_for('feedback_view', assignment_id=assignment.id))
+
     buffer.seek(0)
     log_action('Gerou PDF do relatório', 'assignment', assignment.id, assignment.employee.name)
     filename = f"relatorio_180_{assignment.employee.name.lower().replace(' ', '_')}_{assignment.cycle.start_date.strftime('%Y%m')}.pdf"
